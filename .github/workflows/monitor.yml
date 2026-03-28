@@ -1,77 +1,31 @@
 name: Ticket Monitor
 
 on:
-  # 每 30 秒執行一次 (免費版 GitHub Actions 每小時最多 60 次)
+  # 每分鐘執行一次
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/1 * * * *'
   
-  # 也支援手動觸發
+  # 手動觸發
   workflow_dispatch:
-    inputs:
-      force_notify:
-        description: '強制發送通知'
-        required: false
-        default: 'false'
-
-# 讓並行 workflow 排隊，不要同時跑多個
-concurrency:
-  group: ticket-monitor
-  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
       
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      
-      - name: Download previous state
-        id: prev-state
-        uses: actions/download-artifact@v4
-        with:
-          name: monitor-state
-          continue-on-error: true
+        run: pip install -r requirements.txt
       
       - name: Run monitor
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           TIXCRAFT_ACTIVITY_URL: ${{ secrets.TIXCRAFT_ACTIVITY_URL }}
-          PREV_STATE_FILE: ${{ github.workspace }}/monitor-state/prev_state.json
-        run: |
-          # 如果有上次狀態，複製到正確位置
-          if [ -f "monitor-state/prev_state.json" ]; then
-            mkdir -p .cache
-            cp monitor-state/prev_state.json .cache/prev_state.json
-          fi
-          
-          # 執行監控
-          python monitor.py
-      
-      - name: Upload current state
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: monitor-state
-          path: .last_state.json
-          retention-days: 1
-      
-      - name: Commit state to branch
-        if: always()
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Update monitoring state"
-          file_pattern: ".last_state.json"
-          skip_dirty_check: false
+        run: python monitor.py
