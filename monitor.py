@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-TixCraft 票卷監控器
-- 定時檢查票況
-- 狀態變化時推播 Slack 通知
-- 部署至 GitHub Actions
+TixCraft 票卷監控器 v2
+- 增加瀏覽器偽裝
+- 增加重試機制
+- 更好的錯誤處理
 """
 
 import os
 import json
 import time
+import random
 import logging
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -21,21 +22,11 @@ from bs4 import BeautifulSoup
 # ===== 設定 =====
 @dataclass
 class Config:
-    # Slack
     slack_webhook_url: str
-    
-    # 監控目標
-    tixcraft_activity_url: str  # 例如: https://tixcraft.com/activity/detail/xxx
-    
-    # 通知條件
+    tixcraft_activity_url: str
     notify_on_available: bool = True
     notify_on_sold_out: bool = True
-    
-    # 速率控制（秒）
-    request_delay: float = 2.0  # 請求間隔，避免被封
-    
-    # User-Agent
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 config = Config(
     slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL", ""),
@@ -46,7 +37,7 @@ config = Config(
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
@@ -54,20 +45,17 @@ logger = logging.getLogger(__name__)
 # ===== 票種資料結構 =====
 @dataclass
 class TicketArea:
-    """票種區域"""
-    name: str           # 區域名稱 (如 "特價區", "VIP區")
-    price: str          # 票價
-    status: str         # 狀態 (available / sold_out / unknown)
-    remaining: Optional[int]  # 剩餘數量 (如果有的話)
-
+    name: str
+    price: str
+    status: str
+    remaining: Optional[int] = None
 
 @dataclass
 class MonitorResult:
-    """監控結果"""
     url: str
     timestamp: str
     event_name: str
-    areas: list[TicketArea]
+    areas: list
     has_available: bool
     
     def to_dict(self) -> dict:
@@ -82,175 +70,179 @@ class MonitorResult:
 
 # ===== 爬蟲核心 =====
 class TixCraftMonitor:
-    """TixCraft 票卷監控器"""
-    
     BASE_URL = "https://tixcraft.com"
-    SESSION_FILE = ".session_cache.json"
     
     def __init__(self, config: Config):
         self.config = config
         self.session = self._create_session()
-        
+    
     def _create_session(self) -> requests.Session:
-        """建立 HTTP Session"""
         session = requests.Session()
+        
+        # 偽裝成真實瀏覽器
         session.headers.update({
             "User-Agent": self.config.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         })
         return session
     
-    def _load_session_cookies(self) -> dict:
-        """載入快取的 Session Cookie (如果有)"""
-        if Path(self.SESSION_FILE).exists():
+    def _random_delay(self):
+        """隨機延遲，模擬人類"""
+        delay = random.uniform(1, 3)
+        time.sleep(delay)
+    
+    def fetch_page(self, url: str, retry: int = 3) -> Optional[BeautifulSoup]:
+        """抓取頁面 HTML，帶重試"""
+        
+        for attempt in range(retry):
             try:
-                with open(self.SESSION_FILE, 'r') as f:
-                    cookies = json.load(f)
-                logger.info("已載入快取的 Session Cookie")
-                return cookies
-            except Exception:
-                pass
-        return {}
-    
-    def _save_session_cookies(self, cookies: dict):
-        """儲存 Session Cookie"""
-        try:
-            with open(self.SESSION_FILE, 'w') as f:
-                json.dump(cookies, f)
-            logger.info("已儲存 Session Cookie")
-        except Exception as e:
-            logger.warning(f"無法儲存 Session Cookie: {e}")
-    
-    def fetch_page(self, url: str) -> Optional[BeautifulSoup]:
-        """抓取頁面 HTML"""
-        try:
-            # 先嘗試使用快取的 cookies
-            cached_cookies = self._load_session_cookies()
-            if cached_cookies:
-                self.session.cookies.update(cached_cookies)
-            
-            logger.info(f"正在抓取: {url}")
-            response = self.session.get(url, timeout=30)
-            
-            # 檢查是否被導向登入頁或需要驗證
-            if response.status_code == 200:
-                # 如果有新的 cookies，儲存起來
-                self._save_session_cookies(dict(self.session.cookies))
+                self._random_delay()
+                logger.info(f"正在抓取 (嘗試 {attempt + 1}/{retry}): {url}")
                 
-                # 檢查是否有 Cloudflare 或驗證頁面
-                if self._is_challenge_page(response.text):
-                    logger.warning("檢測到挑戰頁面 (Cloudflare)，可能需要等待或更換 IP")
-                    return None
+                response = self.session.get(url, timeout=30)
+                
+                if response.status_code == 200:
+                    # 檢查是否為挑戰頁面
+                    if self._is_challenge_page(response.text):
+                        logger.warning("檢測到驗證頁面，等待後重試...")
+                        time.sleep(10)
+                        continue
                     
-                return BeautifulSoup(response.text, 'html.parser')
-            else:
-                logger.error(f"HTTP {response.status_code}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            logger.error("請求超時")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"請求失敗: {e}")
+                    logger.info(f"抓取成功，頁面大小: {len(response.text)} bytes")
+                    return BeautifulSoup(response.text, 'lxml')
+                    
+                elif response.status_code == 403:
+                    logger.warning(f"403 拒絕訪問 (嘗試 {attempt + 1}/{retry})")
+                    time.sleep(5)
+                    
+                elif response.status_code == 429:
+                    logger.warning(f"429 请求过多，等待 60 秒...")
+                    time.sleep(60)
+                    
+                else:
+                    logger.error(f"HTTP {response.status_code}")
+                    
+            except requests.exceptions.Timeout:
+                logger.warning("請求超時")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"請求失敗: {e}")
+        
         return None
     
     def _is_challenge_page(self, html: str) -> bool:
-        """檢查是否為挑戰頁面"""
-        challenge_indicators = [
-            "Checking your browser",
-            "Cloudflare",
-            "Access denied",
-            "Just a moment",
-            "checking your browser before accessing"
+        indicators = [
+            "checking your browser",
+            "cloudflare",
+            "access denied",
+            "just a moment",
+            "ray id",
+            "attention required",
+            "sorry, you have been blocked"
         ]
         html_lower = html.lower()
-        return any(indicator.lower() in html_lower for indicator in challenge_indicators)
+        return any(ind in html_lower for ind in indicators)
     
     def parse_ticket_areas(self, soup: BeautifulSoup) -> list[TicketArea]:
         """解析票種區域"""
         areas = []
         
-        # TixCraft 通常用 table 或 div 結構展示票種
-        # 這裡用常見的選擇器模式
-        
-        # 方式1: 找 table 結構
-        tables = soup.find_all('table')
-        for table in tables:
-            rows = table.find_all('tr')
-            for row in rows:
-                cells = row.find_all(['td', 'th'])
-                if len(cells) >= 2:
-                    name_cell = cells[0]
-                    status_cell = cells[-1]  # 最後一欄通常是狀態
-                    
-                    area_name = name_cell.get_text(strip=True)
-                    status_text = status_cell.get_text(strip=True)
-                    
-                    # 解析狀態
-                    status = "unknown"
-                    if any(word in status_text.lower() for word in ['剩餘', 'available', '可購', '熱賣']):
-                        status = "available"
-                    elif any(word in status_text.lower() for word in ['售完', 'sold', 'soldout', '已售']):
-                        status = "sold_out"
-                    
-                    if area_name and area_name not in ['票種', 'Zone', 'Area', '']:
-                        areas.append(TicketArea(
-                            name=area_name,
-                            price="",
-                            status=status
-                        ))
-        
-        # 方式2: 找 div/card 結構 (備用)
-        if not areas:
-            area_cards = soup.find_all(['div', 'li'], class_=lambda x: x and any(
-                keyword in str(x).lower() for keyword in ['area', 'zone', 'ticket', '票種']
-            ))
-            
-            for card in area_cards:
-                # 嘗試提取區域名稱
-                name_elem = card.find(['span', 'div', 'h3', 'h4'])
-                status_elem = card.find_all(['span', 'div', 'p'])
-                
-                if name_elem:
-                    area_name = name_elem.get_text(strip=True)
-                    # 取最後一個狀態相關的元素
-                    status_text = status_elem[-1].get_text(strip=True) if status_elem else ""
-                    
-                    status = "unknown"
-                    if any(word in status_text.lower() for word in ['剩餘', 'available', '可購']):
-                        status = "available"
-                    elif any(word in status_text.lower() for word in ['售完', 'sold', 'soldout']):
-                        status = "sold_out"
-                    
-                    if area_name:
-                        areas.append(TicketArea(
-                            name=area_name,
-                            price="",
-                            status=status
-                        ))
-        
-        return areas
-    
-    def get_event_name(self, soup: BeautifulSoup) -> str:
-        """取得活動名稱"""
-        # 常見的標題選擇器
+        # 嘗試多種選擇器
         selectors = [
-            'h1.event-title',
-            'h1.title',
-            '.event-name',
-            'h1',
-            '.activity-title'
+            # Table 結構
+            ('table', 'ticket'),
+            ('table', 'area'),
+            # Div 結構
+            ('div', 'ticket-item'),
+            ('div', 'area-item'),
+            ('div', 'product'),
+            # List 結構
+            ('li', 'ticket'),
+            ('li', 'area'),
         ]
         
-        for selector in selectors:
+        for tag, classname in selectors:
+            elements = soup.find_all(tag, class_=lambda x: x and classname in str(x).lower())
+            if elements:
+                logger.info(f"找到 {len(elements)} 個票種元素 (tag={tag}, class~={classname})")
+                
+                for elem in elements:
+                    name = ""
+                    price = ""
+                    status = "unknown"
+                    
+                    # 嘗試提取名稱
+                    for name_tag in ['span', 'div', 'h3', 'h4', 'p']:
+                        name_elem = elem.find(name_tag)
+                        if name_elem:
+                            name = name_elem.get_text(strip=True)
+                            if name and len(name) < 100:
+                                break
+                    
+                    # 嘗試提取價格
+                    price_elem = elem.find(class_=lambda x: x and 'price' in str(x).lower())
+                    if price_elem:
+                        price = price_elem.get_text(strip=True)
+                    
+                    # 嘗試提取狀態
+                    text = elem.get_text(strip=True).lower()
+                    if any(w in text for w in ['剩餘', 'available', '可購', '熱賣', '預售']):
+                        status = "available"
+                    elif any(w in text for w in ['售完', 'sold out', 'soldout', '已售', '完售']):
+                        status = "sold_out"
+                    
+                    if name and name not in areas:
+                        areas.append(TicketArea(name=name, price=price, status=status))
+                
+                if areas:
+                    break
+        
+        # 如果都找不到，嘗試從整個頁面文字分析
+        if not areas:
+            logger.info("使用文字掃描方式解析...")
+            text = soup.get_text()
+            
+            # 簡單的關鍵字掃描
+            lines = text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) > 100:
+                    continue
+                    
+                if any(w in line for w in ['區', '區剩餘', '票種']):
+                    status = "unknown"
+                    if any(w in line for w in ['剩餘', '可購']):
+                        status = "available"
+                    elif any(w in line for w in ['售完', '已售']):
+                        status = "sold_out"
+                    
+                    if status != "unknown":
+                        areas.append(TicketArea(name=line[:50], price="", status=status))
+        
+        return areas[:20]  # 最多 20 個
+    
+    def get_event_name(self, soup: BeautifulSoup) -> str:
+        for selector in ['h1', '.event-title', '.title', '.activity-title']:
             elem = soup.select_one(selector)
             if elem:
-                return elem.get_text(strip=True)
-        
+                name = elem.get_text(strip=True)
+                if name and len(name) < 200:
+                    return name
         return "Unknown Event"
     
     def monitor(self) -> Optional[MonitorResult]:
-        """執行一次監控"""
         url = self.config.tixcraft_activity_url
         if not url:
             logger.error("未設定 TIXCRAFT_ACTIVITY_URL")
@@ -258,251 +250,142 @@ class TixCraftMonitor:
         
         soup = self.fetch_page(url)
         if not soup:
+            logger.error("無法抓取頁面")
             return None
         
         areas = self.parse_ticket_areas(soup)
         event_name = self.get_event_name(soup)
-        
         has_available = any(area.status == "available" for area in areas)
         
-        result = MonitorResult(
+        return MonitorResult(
             url=url,
-            timestamp=datetime.now().isoformat(),
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             event_name=event_name,
             areas=areas,
             has_available=has_available
         )
-        
-        return result
 
 
 # ===== Slack 通知 =====
 class SlackNotifier:
-    """Slack 通知器"""
-    
-    def __init__(self, webhook_url: str):
+    def __init__(self, webhook_url: str, config: Config):
         self.webhook_url = webhook_url
+        self.config = config
     
-    def send(self, result: MonitorResult, previous_result: Optional[MonitorResult] = None):
-        """發送 Slack 通知"""
+    def send(self, result: MonitorResult):
         if not self.webhook_url:
             logger.warning("未設定 Slack Webhook URL")
             return
         
-        # 判斷是否需要通知
-        if previous_result:
-            # 比對狀態變化
-            prev_available = previous_result.has_available
-            curr_available = result.has_available
-            
-            if not self.config.notify_on_sold_out and prev_available and not curr_available:
-                logger.info("票已售完，但關閉此通知")
-                return
-            if not self.config.notify_on_available and not prev_available and curr_available:
-                logger.info("有票了，但關閉此通知")
-                return
-        
-        # 構建訊息
-        payload = self._build_payload(result, previous_result)
+        payload = self._build_payload(result)
         
         try:
             response = requests.post(
                 self.webhook_url,
                 json=payload,
-                timeout=10,
+                timeout=15,
                 headers={"Content-Type": "application/json"}
             )
             
             if response.status_code == 200:
-                logger.info("Slack 通知已發送")
+                logger.info("Slack 通知已發送 ✅")
             else:
-                logger.error(f"Slack 通知失敗: {response.status_code}")
+                logger.error(f"Slack 通知失敗: {response.status_code} - {response.text}")
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Slack 通知失敗: {e}")
     
-    def _build_payload(self, result: MonitorResult, previous_result: Optional[MonitorResult]) -> dict:
-        """構建 Slack 訊息"""
-        # Emoji 根據狀態
+    def _build_payload(self, result: MonitorResult) -> dict:
         if result.has_available:
             emoji = "🎉"
             title = f"{emoji} 有票了！"
-            color = "#36a64f"  # 綠色
+            color = "#36a64f"
         else:
             emoji = "😢"
             title = f"{emoji} 票已售完"
-            color = "#ff0000"  # 紅色
+            color = "#ff4444"
         
-        # 構建區域詳情
         area_lines = []
-        for area in result.areas[:10]:  # 最多顯示 10 個
-            if area.status == "available":
-                icon = "✅"
-            elif area.status == "sold_out":
-                icon = "❌"
-            else:
-                icon = "❓"
+        for area in result.areas[:8]:
+            icon = "✅" if area.status == "available" else "❌" if area.status == "sold_out" else "❓"
             area_lines.append(f"{icon} {area.name}")
         
-        if len(result.areas) > 10:
-            area_lines.append(f"...還有 {len(result.areas) - 10} 個區域")
+        if len(result.areas) > 8:
+            area_lines.append(f"...還有 {len(result.areas) - 8} 個區域")
         
-        areas_text = "\n".join(area_lines) if area_lines else "無法取得區域資訊"
+        areas_text = "\n".join(area_lines) if area_lines else "無法取得票種資訊"
         
-        payload = {
-            "attachments": [
-                {
-                    "color": color,
-                    "blocks": [
-                        {
-                            "type": "header",
-                            "text": {
-                                "type": "plain_text",
-                                "text": title,
-                                "emoji": True
-                            }
-                        },
-                        {
-                            "type": "section",
-                            "fields": [
-                                {
-                                    "type": "mrkdwn",
-                                    "text": f"*活動:*\n{result.event_name}"
-                                },
-                                {
-                                    "type": "mrkdwn",
-                                    "text": f"*時間:*\n{result.timestamp}"
-                                }
-                            ]
-                        },
-                        {
-                            "type": "section",
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"*票種狀態:*\n```{areas_text}```"
-                            }
-                        },
-                        {
-                            "type": "actions",
-                            "elements": [
-                                {
-                                    "type": "button",
-                                    "text": {
-                                        "type": "plain_text",
-                                        "text": "立即購票 🎫",
-                                        "emoji": True
-                                    },
-                                    "url": result.url,
-                                    "style": "primary"
-                                }
-                            ]
-                        },
-                        {
-                            "type": "context",
-                            "elements": [
-                                {
-                                    "type": "mrkdwn",
-                                    "text": f"監控時間: {result.timestamp}"
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
+        return {
+            "attachments": [{
+                "color": color,
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": title, "emoji": True}
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*活動:*\n{result.event_name}"},
+                            {"type": "mrkdwn", "text": f"*時間:*\n{result.timestamp}"}
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*票種狀態:*\n```{areas_text}```"}
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [{
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "立即購票 🎫"},
+                            "url": result.url,
+                            "style": "primary"
+                        }]
+                    }
+                ]
+            }]
         }
-        
-        return payload
-
-
-# ===== 狀態快取 =====
-STATE_FILE = ".last_state.json"
-
-def load_last_state() -> Optional[dict]:
-    """載入上次狀態"""
-    # 檢查多個可能的位置
-    possible_paths = [
-        STATE_FILE,
-        ".cache/prev_state.json",
-        "prev_state.json"
-    ]
-    
-    for path in possible_paths:
-        if Path(path).exists():
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    logger.info(f"載入上次狀態: {path}")
-                    return json.load(f)
-            except Exception:
-                pass
-    return None
-
-def save_current_state(result: MonitorResult):
-    """儲存當前狀態"""
-    try:
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"無法儲存狀態: {e}")
 
 
 # ===== 主程式 =====
 def main():
-    logger.info("=" * 50)
-    logger.info("TixCraft 票卷監控器啟動")
-    logger.info("=" * 50)
+    logger.info("=" * 40)
+    logger.info("TixCraft 票卷監控器")
+    logger.info("=" * 40)
     
-    # 驗證必要設定
     if not config.slack_webhook_url:
-        logger.error("錯誤: 請設定 SLACK_WEBHOOK_URL 環境變數")
+        logger.error("錯誤: 請設定 SLACK_WEBHOOK_URL")
         exit(1)
     
     if not config.tixcraft_activity_url:
-        logger.error("錯誤: 請設定 TIXCRAFT_ACTIVITY_URL 環境變數")
+        logger.error("錯誤: 請設定 TIXCRAFT_ACTIVITY_URL")
         exit(1)
     
-    # 建立監控器
-    monitor = TixCraftMonitor(config)
-    notifier = SlackNotifier(config.slack_webhook_url)
+    logger.info(f"監控目標: {config.tixcraft_activity_url}")
     
-    # 執行監控
+    monitor = TixCraftMonitor(config)
+    notifier = SlackNotifier(config.slack_webhook_url, config)
+    
     result = monitor.monitor()
     
     if result:
-        # 顯示結果
         logger.info(f"活動: {result.event_name}")
-        logger.info(f"有票: {'是' if result.has_available else '否'}")
-        logger.info(f"區域數: {len(result.areas)}")
+        logger.info(f"有票: {'是 ✅' if result.has_available else '否 ❌'}")
+        logger.info(f"找到 {len(result.areas)} 個票種")
         
         for area in result.areas:
-            logger.info(f"  - {area.name}: {area.status}")
+            status_icon = "✅" if area.status == "available" else "❌" if area.status == "sold_out" else "❓"
+            logger.info(f"  {status_icon} {area.name}")
         
-        # 載入上次狀態
-        last_state = load_last_state()
-        previous_result = None
+        # 發送 Slack 通知
+        notifier.send(result)
         
-        if last_state:
-            logger.info("發現上次狀態，將比對變化...")
-            previous_result = MonitorResult(
-                url=last_state.get("url", ""),
-                timestamp=last_state.get("timestamp", ""),
-                event_name=last_state.get("event_name", ""),
-                areas=[TicketArea(**a) for a in last_state.get("areas", [])],
-                has_available=last_state.get("has_available", False)
-            )
-        
-        # 發送通知 (如果有變化或是第一次)
-        if result.has_available or not previous_result:
-            notifier.send(result, previous_result)
-        else:
-            logger.info("狀態無變化，不發送通知")
-        
-        # 儲存當前狀態
-        save_current_state(result)
     else:
         logger.error("監控失敗")
         exit(1)
     
-    logger.info("監控完成")
+    logger.info("完成 ✅")
 
 
 if __name__ == "__main__":
