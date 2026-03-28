@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,21 +38,6 @@ jobs:
         run: |
           pip install -r requirements.txt
       
-      - name: Run monitor
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          TIXCRAFT_ACTIVITY_URL: ${{ secrets.TIXCRAFT_ACTIVITY_URL }}
-        run: |
-          python monitor.py
-      
-      - name: Upload state artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: monitor-state
-          path: .last_state.json
-          retention-days: 1
-      
       - name: Download previous state
         id: prev-state
         uses: actions/download-artifact@v4
@@ -58,9 +45,33 @@ jobs:
           name: monitor-state
           continue-on-error: true
       
-      - name: Commit state update
-        uses: actions/commit-artifact-and-push@v4
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TIXCRAFT_ACTIVITY_URL: ${{ secrets.TIXCRAFT_ACTIVITY_URL }}
+          PREV_STATE_FILE: ${{ github.workspace }}/monitor-state/prev_state.json
+        run: |
+          # 如果有上次狀態，複製到正確位置
+          if [ -f "monitor-state/prev_state.json" ]; then
+            mkdir -p .cache
+            cp monitor-state/prev_state.json .cache/prev_state.json
+          fi
+          
+          # 執行監控
+          python monitor.py
+      
+      - name: Upload current state
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          commit-message: "Update monitoring state"
-          file-pattern: ".last_state.json"
+          name: monitor-state
+          path: .last_state.json
+          retention-days: 1
+      
+      - name: Commit state to branch
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update monitoring state"
+          file_pattern: ".last_state.json"
+          skip_dirty_check: false
