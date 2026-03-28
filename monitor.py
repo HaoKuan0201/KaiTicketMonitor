@@ -419,12 +419,21 @@ STATE_FILE = ".last_state.json"
 
 def load_last_state() -> Optional[dict]:
     """載入上次狀態"""
-    if Path(STATE_FILE).exists():
-        try:
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
+    # 檢查多個可能的位置
+    possible_paths = [
+        STATE_FILE,
+        ".cache/prev_state.json",
+        "prev_state.json"
+    ]
+    
+    for path in possible_paths:
+        if Path(path).exists():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    logger.info(f"載入上次狀態: {path}")
+                    return json.load(f)
+            except Exception:
+                pass
     return None
 
 def save_current_state(result: MonitorResult):
