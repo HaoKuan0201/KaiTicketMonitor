@@ -1,0 +1,95 @@
+name: Ticket Monitor
+
+on:
+  # 每 30 秒執行一次 (免費版 GitHub Actions 每小時最多 60 次)
+  # 排程監控用固定的 URL
+  schedule:
+    - cron: '*/30 * * * *'
+  
+  # 手動觸發 - 可以動態輸入 URL
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'TixCraft 活動頁 URL'
+        required: true
+        type: string
+      mode:
+        description: '模式 (check/notify)'
+        required: false
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - notify
+          - watch
+
+# 讓並行 workflow 排隊，不要同時跑多個
+concurrency:
+  group: ticket-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Determine URL
+        id: url
+        run: |
+          # 手動觸發時用輸入的 URL
+          if [ -n "${{ inputs.url }}" ]; then
+            echo "mode=manual" >> $GITHUB_OUTPUT
+            echo "url=${{ inputs.url }}" >> $GITHUB_OUTPUT
+            echo "action=${{ inputs.mode }}" >> $GITHUB_OUTPUT
+            echo "使用手動輸入的 URL: ${{ inputs.url }}"
+          else
+            # 排程執行時用 Secrets 裡的 URL
+            echo "mode=scheduled" >> $GITHUB_OUTPUT
+            echo "url=${{ secrets.TIXCRAFT_ACTIVITY_URL }}" >> $GITHUB_OUTPUT
+            echo "action=watch" >> $GITHUB_OUTPUT
+            echo "使用排程監控 URL: ${{ secrets.TIXCRAFT_ACTIVITY_URL }}"
+          fi
+      
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TIXCRAFT_ACTIVITY_URL: ${{ steps.url.outputs.url }}
+          MONITOR_MODE: ${{ inputs.mode || 'watch' }}
+        run: |
+          echo "監控模式: $MONITOR_MODE"
+          python monitor.py
+      
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-state
+          path: .last_state.json
+          retention-days: 1
+      
+      - name: Download previous state
+        id: prev-state
+        uses: actions/download-artifact@v4
+        with:
+          name: monitor-state
+          continue-on-error: true
+      
+      - name: Commit state update
+        uses: actions/commit-artifact-and-push@v4
+        if: always()
+        with:
+          commit-message: "Update monitoring state"
+          file-pattern: ".last_state.json"
